@@ -1,4 +1,3 @@
-use percent_encoding::AsciiSet;
 use reqwest::Client;
 use reqwest::Method;
 
@@ -6,17 +5,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use csv;
-use std::fs::File;
-use std::io::BufWriter;
 use futures::{stream, StreamExt};
-use percent_encoding::utf8_percent_encode;
-
+use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::BufWriter;
 
 const USER_AGENT: &str = "JustTestingForNow/0.0 (testing@protonmail.ch)";
 const LENGTH_ID_PREFIX: usize = "http://www.wikidata.org/entity/".len();
-const LENGTH_ARTICLE_PREFIX: usize = "https://en.wikipedia.org/wiki/".len();
 const CONCURRENT_REQUESTS: usize = 50;
-const PERCENT_ENCODING: &AsciiSet = &percent_encoding::CONTROLS.add(b'/');
 
 #[derive(Debug, Clone)]
 struct Country {
@@ -41,12 +37,14 @@ struct Record {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let countries = query_countries().await?;
     println!("Got countries.");
 
-    let germany = countries.into_iter().find(|country| country.name == "Poland").unwrap();
-        
+    let germany = countries
+        .into_iter()
+        .find(|country| country.name == "Germany")
+        .unwrap();
 
     let cities = query_cities(germany).await?;
     println!("Got cities.");
@@ -56,23 +54,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // println!("{:?}", rec);
 
     let zukunft = stream::iter(cities.into_iter())
-        .map(|city| async {
-                get_better_record(city).await
-            }
-         )
+        .map(|city| async { get_better_record(city).await })
         .buffer_unordered(CONCURRENT_REQUESTS);
     let results: Vec<Record> = zukunft
-        .filter_map(|val| 
-            async {
-                val.ok()
-            })
-        .collect::<Vec<_>>().await;
+        .filter_map(|val| async { val.ok() })
+        .collect::<Vec<_>>()
+        .await;
 
-    serialize_data(results)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open("data.csv")
+        .unwrap();
+
+    serialize_data(&mut file, results)?;
+
     Ok(())
 }
 
-async fn query_countries() -> Result<Vec<Country>, Box<dyn std::error::Error>> {
+async fn query_countries() -> Result<Vec<Country>, Box<dyn Error>> {
+    // TODO: Rewrite by using schema:name like in cities query for name
     let query = "
         SELECT DISTINCT ?entity ?entityLabel WHERE {
           ?entity wdt:P31 wd:Q6256 . 
@@ -129,16 +131,17 @@ async fn query_countries() -> Result<Vec<Country>, Box<dyn std::error::Error>> {
     Ok(countries)
 }
 
-async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn std::error::Error>> {
+async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn Error>> {
     let query = format!(
         "
-    SELECT DISTINCT ?entity ?article WHERE {{
-      ?article schema:about ?entity .
-      ?article schema:isPartOf <https://en.wikipedia.org/>.
-      ?entity (wdt:P31/(wdt:P279*)) wd:Q515.
-      ?entity wdt:P17 wd:{}.
-    }}
-    ",
+        SELECT DISTINCT ?entity ?article ?name WHERE {{
+            ?article schema:about ?entity .
+            ?article schema:isPartOf <https://en.wikipedia.org/> .
+            ?article schema:name ?name .
+            ?entity (wdt:P31/(wdt:P279*)) wd:Q515.
+            ?entity wdt:P17 wd:{}.
+        }}
+        ",
         country.id
     );
 
@@ -164,12 +167,12 @@ async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn std::error:
         .iter()
         .map(|val| City {
             name: val
-                .get("article")
+                .get("name")
                 .unwrap()
                 .get("value")
                 .unwrap()
                 .as_str()
-                .unwrap()[LENGTH_ARTICLE_PREFIX..]
+                .unwrap()
                 .to_owned(),
             id: val
                 .get("entity")
@@ -186,9 +189,9 @@ async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn std::error:
     Ok(cities)
 }
 
-async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
+async fn get_summary_record(city: City) -> Result<Record, Box<dyn Error>> {
     let query: String =
-        "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &utf8_percent_encode(&city.name, PERCENT_ENCODING).to_string();
+        "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &city.name;
     let mut attempts = 0;
     let res = loop {
         let request = Client::new()
@@ -225,7 +228,7 @@ async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Er
     })
 }
 
-async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
+async fn get_better_record(city: City) -> Result<Record, Box<dyn Error>> {
     let query: &str = "https://en.wikipedia.org/w/api.php?";
     let mut attempts = 0;
     let res = loop {
@@ -239,13 +242,10 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
                 ("exintro", "1"),
                 ("explaintext", "1"),
                 ("redirects", "1"),
-                ("titles", &utf8_percent_encode(&city.name, PERCENT_ENCODING).to_string())
-                ]);
+                ("titles", &city.name),
+            ]);
 
-        let res = request
-            .send()
-            .await
-            .and_then(|req| req.error_for_status());
+        let res = request.send().await.and_then(|req| req.error_for_status());
 
         match res {
             Ok(res) => break res,
@@ -254,9 +254,12 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
                     return Err(Box::new(err));
                 }
                 attempts += 1;
-                println!("Request {} timed out {attempts} times. Trying again ...", city.name);
-                continue
-            },
+                println!(
+                    "Request {} timed out {attempts} times. Trying again ...",
+                    city.name
+                );
+                continue;
+            }
             Err(err) => {
                 println!("Error fetching {:?}: {:?}", city.name, err);
                 return Err(Box::new(err));
@@ -264,9 +267,7 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
         }
     };
 
-    let res = res
-        .json::<Value>()
-        .await?;
+    let res = res.json::<Value>().await?;
 
     let val = res
         .get("query")
@@ -279,6 +280,8 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
         .next()
         .unwrap();
 
+    println!("{:?}", val);
+
     Ok(Record {
         country: city.country.to_owned(),
         name: val.get("title").unwrap().to_string(),
@@ -287,8 +290,7 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
     })
 }
 
-fn serialize_data(data: Vec<Record>) -> Result<(), Box<dyn std::error::Error>> {
-    let f = File::create("./data.csv")?;
+fn serialize_data<WR: std::io::Write>(f: &mut WR, data: Vec<Record>) -> Result<(), Box<dyn Error>> {
     let f = BufWriter::new(f);
     let mut wtr = csv::Writer::from_writer(f);
 
