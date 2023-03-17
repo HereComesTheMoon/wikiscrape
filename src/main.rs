@@ -189,6 +189,7 @@ async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn std::error:
 async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
     let query: String =
         "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &utf8_percent_encode(&city.name, PERCENT_ENCODING).to_string();
+    let mut attempts = 0;
     let res = loop {
         let request = Client::new()
             .request(Method::GET, &query)
@@ -199,7 +200,18 @@ async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Er
 
         match request {
             Ok(res) => break res,
-            Err(err) => println!("Error fetching {:?}: {:?}", city.name, err),
+            Err(err) if err.is_timeout() => {
+                if 5 < attempts {
+                    return Err(Box::new(err));
+                }
+                attempts += 1;
+                println!("Request {} timed out {attempts} times. Trying again ...", city.name);
+                continue
+            },
+            Err(err) => {
+                println!("Error fetching {:?}: {:?}", city.name, err);
+                return Err(Box::new(err));
+            }
         }
     };
 
@@ -215,6 +227,7 @@ async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Er
 
 async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
     let query: &str = "https://en.wikipedia.org/w/api.php?";
+    let mut attempts = 0;
     let res = loop {
         let request = Client::new()
             .request(Method::GET, query)
@@ -236,7 +249,18 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Err
 
         match res {
             Ok(res) => break res,
-            Err(err) => println!("Error fetching {:?}: {:?}", city.name, err),
+            Err(err) if err.is_timeout() => {
+                if 5 < attempts {
+                    return Err(Box::new(err));
+                }
+                attempts += 1;
+                println!("Request {} timed out {attempts} times. Trying again ...", city.name);
+                continue
+            },
+            Err(err) => {
+                println!("Error fetching {:?}: {:?}", city.name, err);
+                return Err(Box::new(err));
+            }
         }
     };
 
