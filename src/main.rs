@@ -1,19 +1,22 @@
+use percent_encoding::AsciiSet;
 use reqwest::Client;
 use reqwest::Method;
 
-use serde::{Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use csv;
 use std::fs::File;
 use std::io::BufWriter;
 use futures::{stream, StreamExt};
-use futures::future;
+use percent_encoding::utf8_percent_encode;
+
 
 const USER_AGENT: &str = "JustTestingForNow/0.0 (testing@protonmail.ch)";
 const LENGTH_ID_PREFIX: usize = "http://www.wikidata.org/entity/".len();
 const LENGTH_ARTICLE_PREFIX: usize = "https://en.wikipedia.org/wiki/".len();
-const CONCURRENT_REQUESTS: usize = 10;
+const CONCURRENT_REQUESTS: usize = 50;
+const PERCENT_ENCODING: &AsciiSet = &percent_encoding::CONTROLS.add(b'/');
 
 #[derive(Debug, Clone)]
 struct Country {
@@ -39,54 +42,33 @@ struct Record {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let res = query_countries().await?;
+    let countries = query_countries().await?;
+    println!("Got countries.");
 
-    let cities = query_cities(res[0].clone()).await?;
-    // let city_names = cities.iter().map(|city| &city.name);
+    let germany = countries.into_iter().find(|country| country.name == "Poland").unwrap();
+        
 
-    // // let client = Client::new();
-    // let bodies = stream::iter(cities)
-    //     .map(|city| {
-    //         // let client = &client;
-    //         async {
-    //             get_record(city).await.unwrap()
-    //         }
-    //         // async move {
-    //         //     let resp = client.get(url).send().await?;
-    //         //     resp.bytes().await
-    //         // }
-    //     })
-    //     .buffer_unordered(CONCURRENT_REQUESTS);
+    let cities = query_cities(germany).await?;
+    println!("Got cities.");
 
-    // futures::future::join_all(bodies);
+    // let rec = get_better_record(cities[0].clone()).await?;
+
+    // println!("{:?}", rec);
 
     let zukunft = stream::iter(cities.into_iter())
         .map(|city| async {
-                get_record(city).await.unwrap()
+                get_better_record(city).await
             }
-        )
+         )
         .buffer_unordered(CONCURRENT_REQUESTS);
-    // futures::future::join_all(zukunft).await;
-    // zukunft.for_each(|b| async move {
-    //     println!("Res: {:?}", b);
-    // }).await;
+    let results: Vec<Record> = zukunft
+        .filter_map(|val| 
+            async {
+                val.ok()
+            })
+        .collect::<Vec<_>>().await;
 
-    let mut results: Vec<Record> = zukunft.collect::<Vec<_>>().await;
-
-    // bodies
-    //     .for_each(|b| async {
-    //         match b {
-    //             Ok(res) => results.push(res),
-    //             Err(e) => println!("Oh no! {:?}", e),
-    //         }
-    //     });
-
-    // println!("{:?}", cities);
-    // for entry in cities {
-    //     println!("{:?}", entry);
-    //     let summary = get_record(entry).await?;
-    //     println!("{:?}", summary);
-    // }
+    serialize_data(results)?;
     Ok(())
 }
 
@@ -204,16 +186,16 @@ async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn std::error:
     Ok(cities)
 }
 
-async fn get_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
+async fn get_summary_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
     let query: String =
-        "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &city.name;
+        "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &utf8_percent_encode(&city.name, PERCENT_ENCODING).to_string();
     let res = loop {
         let request = Client::new()
             .request(Method::GET, &query)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .send()
-            .await?
-            .error_for_status();
+            .await
+            .and_then(|req| req.error_for_status());
 
         match request {
             Ok(res) => break res,
@@ -225,14 +207,64 @@ async fn get_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
 
     Ok(Record {
         country: city.country.to_owned(),
-        name: city.name,
+        name: res.get("title").unwrap().to_string(),
         description: res.get("extract").unwrap().to_string(),
         id: city.id,
     })
 }
 
+async fn get_better_record(city: City) -> Result<Record, Box<dyn std::error::Error>> {
+    let query: &str = "https://en.wikipedia.org/w/api.php?";
+    let res = loop {
+        let request = Client::new()
+            .request(Method::GET, query)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .query(&[
+                ("action", "query"),
+                ("format", "json"),
+                ("prop", "extracts"),
+                ("exintro", "1"),
+                ("explaintext", "1"),
+                ("redirects", "1"),
+                ("titles", &utf8_percent_encode(&city.name, PERCENT_ENCODING).to_string())
+                ]);
+
+        let res = request
+            .send()
+            .await
+            .and_then(|req| req.error_for_status());
+
+        match res {
+            Ok(res) => break res,
+            Err(err) => println!("Error fetching {:?}: {:?}", city.name, err),
+        }
+    };
+
+    let res = res
+        .json::<Value>()
+        .await?;
+
+    let val = res
+        .get("query")
+        .unwrap()
+        .get("pages")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+
+    Ok(Record {
+        country: city.country.to_owned(),
+        name: val.get("title").unwrap().to_string(),
+        description: val.get("extract").unwrap().to_string(),
+        id: city.id,
+    })
+}
+
 fn serialize_data(data: Vec<Record>) -> Result<(), Box<dyn std::error::Error>> {
-    let f = File::open("./data.csv")?;
+    let f = File::create("./data.csv")?;
     let f = BufWriter::new(f);
     let mut wtr = csv::Writer::from_writer(f);
 
