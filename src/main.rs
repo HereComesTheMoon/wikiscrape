@@ -38,43 +38,41 @@ struct Record {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let countries = query_countries().await?;
-    println!("Got countries.");
+    compute_all("data.csv").await
+}
 
-    let germany = countries
-        .into_iter()
-        .find(|country| country.name == "Germany")
-        .unwrap();
-
-    let cities = query_cities(germany).await?;
-    println!("Got cities.");
-
-    // let rec = get_better_record(cities[0].clone()).await?;
-
-    // println!("{:?}", rec);
-
-    let zukunft = stream::iter(cities.into_iter())
-        .map(|city| async { get_better_record(city).await })
-        .buffer_unordered(CONCURRENT_REQUESTS);
-    let results: Vec<Record> = zukunft
-        .filter_map(|val| async { val.ok() })
-        .collect::<Vec<_>>()
-        .await;
-
+async fn compute_all(output_file: &str) -> Result<(), Box<dyn Error>> {
     let mut file = OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
-        .open("data.csv")
+        .open(output_file)
         .unwrap();
 
-    serialize_data(&mut file, results)?;
+    let countries = stream::iter(query_countries().await?)
+        .map(|country| async {
+            query_cities(country).await.unwrap()
+        })
+    .buffered(CONCURRENT_REQUESTS)
+    .collect::<Vec<_>>()
+    .await;
+    for country in countries {
+        let result = stream::iter(country.into_iter())
+            .map(|city| async { get_better_record(city).await })
+            .buffer_unordered(CONCURRENT_REQUESTS)
+            .filter_map(|val| async { val.ok() })
+            .collect::<Vec<_>>()
+            .await;
 
+        if let Err(e) = serialize_data(&mut file, result) {
+            println!("Error printing! {}", e);
+        }
+    }
     Ok(())
 }
 
 async fn query_countries() -> Result<Vec<Country>, Box<dyn Error>> {
-    // TODO: Rewrite by using schema:name like in cities query for name
+    // TODO: Rewrite by using schema:name like in cities query for name?
     let query = "
         SELECT DISTINCT ?entity ?entityLabel WHERE {
           ?entity wdt:P31 wd:Q6256 . 
@@ -279,8 +277,6 @@ async fn get_better_record(city: City) -> Result<Record, Box<dyn Error>> {
         .values()
         .next()
         .unwrap();
-
-    println!("{:?}", val);
 
     Ok(Record {
         country: city.country.to_owned(),
