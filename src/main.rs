@@ -58,7 +58,7 @@ async fn compute_all(output_file: &str) -> Result<(), Box<dyn Error>> {
     .await;
     for country in countries {
         let result = stream::iter(country.into_iter())
-            .map(|city| async { get_better_record(city).await })
+            .map(|city| async { get_record(city).await })
             .buffer_unordered(CONCURRENT_REQUESTS)
             .filter_map(|val| async { val.ok() })
             .collect::<Vec<_>>()
@@ -187,46 +187,7 @@ async fn query_cities(country: Country) -> Result<Vec<City>, Box<dyn Error>> {
     Ok(cities)
 }
 
-async fn get_summary_record(city: City) -> Result<Record, Box<dyn Error>> {
-    let query: String =
-        "https://en.wikipedia.org/api/rest_v1/page/summary/".to_owned() + &city.name;
-    let mut attempts = 0;
-    let res = loop {
-        let request = Client::new()
-            .request(Method::GET, &query)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            .and_then(|req| req.error_for_status());
-
-        match request {
-            Ok(res) => break res,
-            Err(err) if err.is_timeout() => {
-                if 5 < attempts {
-                    return Err(Box::new(err));
-                }
-                attempts += 1;
-                println!("Request {} timed out {attempts} times. Trying again ...", city.name);
-                continue
-            },
-            Err(err) => {
-                println!("Error fetching {:?}: {:?}", city.name, err);
-                return Err(Box::new(err));
-            }
-        }
-    };
-
-    let res = res.json::<Value>().await?;
-
-    Ok(Record {
-        country: city.country.to_owned(),
-        name: res.get("title").unwrap().to_string(),
-        description: res.get("extract").unwrap().to_string(),
-        id: city.id,
-    })
-}
-
-async fn get_better_record(city: City) -> Result<Record, Box<dyn Error>> {
+async fn get_record(city: City) -> Result<Record, Box<dyn Error>> {
     let query: &str = "https://en.wikipedia.org/w/api.php?";
     let mut attempts = 0;
     let res = loop {
